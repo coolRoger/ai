@@ -6,7 +6,8 @@ import {
   resolveEmbeddingInput,
   unsupportedFileSourceError,
 } from '@tanstack/ai'
-import { getCohereApiKeyFromEnv, resolveCohereTransport } from '../utils/client'
+import { getCohereApiKeyFromEnv } from '../utils/client'
+import { createCohereClient } from '../client'
 import type {
   EmbeddingOptions,
   EmbeddingResult,
@@ -20,6 +21,10 @@ import type {
 } from '../model-meta'
 import type { CohereEmbeddingProviderOptions } from '../embedding/embedding-provider-options'
 import type { CohereClientConfig } from '../utils/client'
+import type {
+  CoherePostV2EmbedBody,
+  EmbedContent,
+} from '../generated/client/types'
 
 /**
  * Configuration for Cohere embedding adapter.
@@ -82,35 +87,6 @@ async function fetchWithTimeout(
   }
 }
 
-/** One content part of a Cohere v2/embed fused input. */
-type CohereEmbedContentPart =
-  | { type: 'text'; text: string }
-  | { type: 'image_url'; image_url: { url: string } }
-
-/** Wire shape of the Cohere v2/embed request body. */
-interface CohereEmbedRequestBody {
-  model: string
-  inputs: Array<{ content: Array<CohereEmbedContentPart> }>
-  input_type: CohereEmbeddingProviderOptions['inputType']
-  embedding_types: ['float']
-  truncate?: 'NONE' | 'START' | 'END'
-  output_dimension?: number
-}
-
-/** Wire shape of the Cohere v2/embed response (fields the adapter reads). */
-interface CohereEmbedResponse {
-  id?: string
-  embeddings?: {
-    float?: Array<Array<number>>
-  }
-  meta?: {
-    billed_units?: {
-      input_tokens?: number
-      images?: number
-    }
-  }
-}
-
 /**
  * Cohere Embedding Adapter
  *
@@ -162,9 +138,10 @@ export class CohereEmbeddingAdapter<
       const resolved = resolveEmbeddingInput(options.input)
       const inputs = await Promise.all(
         resolved.map(async (item) => {
-          const content: Array<CohereEmbedContentPart> = item.texts.map(
-            (text) => ({ type: 'text', text }),
-          )
+          const content: Array<EmbedContent> = item.texts.map((text) => ({
+            type: 'text',
+            text,
+          }))
           for (const image of item.images) {
             content.push({
               type: 'image_url',
@@ -178,7 +155,9 @@ export class CohereEmbeddingAdapter<
       )
 
       const timeoutMs = this.clientConfig.timeout ?? DEFAULT_TIMEOUT_MS
-      const transport = resolveCohereTransport(this.clientConfig)
+      const client = createCohereClient(this.clientConfig, (url, init) =>
+        fetchWithTimeout(url, init, timeoutMs),
+      )
 
       const vectors: Array<Array<number>> = []
       let inputTokens: number | undefined
@@ -191,7 +170,8 @@ export class CohereEmbeddingAdapter<
 
         // embedding_types is pinned to ['float'] (overriding any disagreeing
         // modelOptions.embeddingTypes) so vectors are always number[].
-        const body: CohereEmbedRequestBody = {
+        const body: CoherePostV2EmbedBody = {
+          // @ts-expect-error public type mismatch: `EmbeddingOptions.model` is any string, the document enumerates Cohere model ids.
           model,
           inputs: batch,
           input_type: inputType,
@@ -210,43 +190,7 @@ export class CohereEmbeddingAdapter<
           { provider: this.name, model },
         )
 
-        const response = await fetchWithTimeout(
-          `${transport.baseUrl}/v2/embed`,
-          {
-            method: 'POST',
-            headers: {
-              Authorization: `Bearer ${this.clientConfig.apiKey}`,
-              'Content-Type': 'application/json',
-              ...transport.headers,
-            },
-            body: JSON.stringify(body),
-            ...(options.abortSignal && { signal: options.abortSignal }),
-          },
-          timeoutMs,
-        )
-
-        if (!response.ok) {
-          const bodyText = await response.text()
-          let message = bodyText
-          try {
-            const parsed: unknown = JSON.parse(bodyText)
-            if (
-              typeof parsed === 'object' &&
-              parsed !== null &&
-              'message' in parsed &&
-              typeof parsed.message === 'string'
-            ) {
-              message = parsed.message
-            }
-          } catch {
-            // Not JSON — fall back to the raw body text.
-          }
-          throw new Error(
-            `Cohere embed failed (${response.status}): ${message}`,
-          )
-        }
-
-        const data = (await response.json()) as CohereEmbedResponse
+        const data = await client.embed(body, options.abortSignal)
 
         const batchVectors = data.embeddings?.float
         if (!batchVectors) {
